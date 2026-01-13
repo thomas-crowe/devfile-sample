@@ -1,67 +1,74 @@
-const Prometheus = require('prom-client')
+require('dotenv').config(); // Load environment variables from .env file
 const express = require('express');
-const http = require('http');
-
-Prometheus.collectDefaultMetrics();
-
-const requestHistogram = new Prometheus.Histogram({
-    name: 'http_request_duration_seconds',
-    help: 'Duration of HTTP requests in seconds',
-    labelNames: ['code', 'handler', 'method'],
-    buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]
-})
-
-const requestTimer = (req, res, next) => {
-  const path = new URL(req.url, `http://${req.hostname}`).pathname
-  const stop = requestHistogram.startTimer({
-    method: req.method,
-    handler: path
-  })
-  res.on('finish', () => {
-    stop({
-      code: res.statusCode
-    })
-  })
-  next()
-}
+const bodyParser = require('body-parser');
+const { Pool } = require('pg');
 
 const app = express();
-const server = http.createServer(app)
+const PORT = 3000;
 
-// See: http://expressjs.com/en/4x/api.html#app.settings.table
-const PRODUCTION = app.get('env') === 'production';
-
-// Administrative routes are not timed or logged, but for non-admin routes, pino
-// overhead is included in timing.
-app.get('/ready', (req, res) => res.status(200).json({status:"ok"}));
-app.get('/live', (req, res) => res.status(200).json({status:"ok"}));
-app.get('/metrics', async (req, res, next) => {
-  const metrics = await Prometheus.register.metrics();
-  res.set('Content-Type', Prometheus.register.contentType)
-  res.end(metrics);
-})
-
-// Time routes after here.
-app.use(requestTimer);
-
-// Log routes after here.
-const pino = require('pino')({
-  level: PRODUCTION ? 'info' : 'debug',
-});
-app.use(require('pino-http')({logger: pino}));
-
-app.get('/', (req, res) => {
-  // Use req.log (a `pino` instance) to log JSON:
-  req.log.info({message: 'Hello from Node.js Starter Application!'});
-  res.send('Hello from Node.js Starter Application!');
+// Database connection setup (PostgreSQL)
+const pool = new Pool({
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  password: process.env.DB_PASS,
+  port: process.env.DB_PORT,
+  ssl: {
+    rejectUnauthorized: false
+  }
 });
 
-app.get('*', (req, res) => {
-  res.status(404).send("Not Found");
+// Authentication Middleware (if needed)
+const requireAuth = (req, res, next) => {
+  const incomingToken = req.headers['x-webhook-secret'];
+  const expectedToken = process.env.WEBHOOK_SECRET;
+
+  if (!incomingToken || incomingToken !== expectedToken) {
+    console.warn(`Unauthorized access attempt to webhook endpoint from IP:, ${req.ip}`);
+    return res.status(403).send('Forbidden: Invalid or missing token');
+  }
+  next();
+};
+
+// Middleware to parse incoming JSON payloads
+app.use(bodyParser.json());
+
+// Middleware to parse incoming JSON payloads
+// This is essential for the server to understand the JSON sent by the webhook
+app.use(express.json());
+
+// The Webhook Endpoint
+app.post('/webhook', requireAuth, async (req, res) => {
+  
+  const payload = req.body;
+ 
+  if (!payload || Object.keys(payload).length === 0) {
+    console.error('Received empty payload');
+    return res.status(400).send('Payload required');
+  }
+
+  try {
+    // Example: Insert payload into a database table named 'webhooks'
+    const eventType = payload.type || 'unknown';
+    const query = `
+        INSERT INTO ghl_webhook(event_type, payload) 
+        VALUES($1, $2)
+        RETURNING id;
+        `;
+
+    const values = [eventType, JSON.stringify(payload)];
+    const result = await pool.query(query, values);
+
+    console.log(`Inserted webhook with ID: ${result.rows[0].id}`);
+    res.status(200).send({ status: 'success', message: 'Webhook received and stored successfully' });
+
+  } catch (error) {
+    console.error('Error inserting JSON into database:', error);
+    res.status(500).send('Internal Server Error');
+  }
 });
 
-// Listen and serve.
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`App started on PORT ${PORT}`);
+// Start the Server
+app.listen(PORT, () => {
+  console.log(`🚀 Webhook listener running on http://localhost:${PORT}`);
 });
